@@ -1,9 +1,12 @@
 use crate::commands::AsyncCommandContext;
 use crate::utils::FileSystemTree;
 use async_zip::base::write::ZipFileWriter;
-use async_zip::{Compression, DeflateOption, ZipEntryBuilder};
+use async_zip::{DeflateOption, ZipEntryBuilder};
+use flate2::read::ZlibEncoder;
+use flate2::{Compression, CrcReader};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -74,8 +77,7 @@ impl WriteMessage {
 
 struct WriteState {
     zip: Option<ZipFileWriter<Compat<File>>>,
-    compression: Compression,
-    deflate_option: DeflateOption,
+    compression_level: Compression,
     next_write_idx: usize,
     pending: BTreeMap<usize, (String, Option<CompressedData>)>,
 
@@ -85,14 +87,12 @@ struct WriteState {
 impl WriteState {
     fn new(
         zip: ZipFileWriter<Compat<File>>,
-        compression: Compression,
-        deflate_option: DeflateOption,
+        compression_level: Compression,
         rx: std::sync::mpsc::Receiver<WriteMessage>,
     ) -> Self {
         Self {
             zip: Some(zip),
-            compression,
-            deflate_option,
+            compression_level,
             next_write_idx: 0,
             pending: BTreeMap::new(),
             rx,
@@ -118,15 +118,18 @@ impl WriteState {
             if let Some(zip) = self.zip.as_mut() {
                 match entry_data {
                     None => {
-                        let entry = ZipEntryBuilder::new(name.into(), self.compression.clone())
-                            .deflate_option(self.deflate_option.clone());
+                        let entry =
+                            ZipEntryBuilder::new(name.into(), async_zip::Compression::Stored);
                         zip.write_entry_whole(entry.build(), b"").await?;
                     }
                     Some(cd) => {
-                        let entry = ZipEntryBuilder::new(name.into(), self.compression.clone())
-                            .deflate_option(self.deflate_option.clone())
-                            .crc32(cd.crc32)
-                            .uncompressed_size(cd.uncompressed_size);
+                        let entry =
+                            ZipEntryBuilder::new(name.into(), async_zip::Compression::Deflate)
+                                .deflate_option(DeflateOption::Other(
+                                    self.compression_level.level() as i32,
+                                ))
+                                .crc32(cd.crc32)
+                                .uncompressed_size(cd.uncompressed_size);
                         zip.write_entry_whole_precompressed(entry.build(), &cd.bytes)
                             .await?;
                     }
@@ -148,8 +151,7 @@ impl WriteState {
 pub(crate) async fn parallel_compress_zip(
     tree: FileSystemTree,
     destination: PathBuf,
-    compression: Compression,
-    deflate_option: DeflateOption,
+    compression_level: Compression,
     ctx: AsyncCommandContext<TauriCreateBackupProgress>,
 ) -> Result<(), CompressError> {
     let total = tree.count_all();
@@ -164,7 +166,7 @@ pub(crate) async fn parallel_compress_zip(
     let writer = ZipFileWriter::with_tokio(file);
 
     let (sender, rx) = std::sync::mpsc::channel();
-    let write_state = WriteState::new(writer, compression.clone(), deflate_option.clone(), rx);
+    let write_state = WriteState::new(writer, compression_level.clone(), rx);
 
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let semaphore = Arc::new(Semaphore::new(threads));
@@ -191,31 +193,26 @@ pub(crate) async fn parallel_compress_zip(
             let absolute_path = entry.absolute_path().to_path_buf();
 
             let sender = sender.clone();
-            let compression = compression.clone();
-            let deflate_option = deflate_option.clone();
+            let compression_level = compression_level.clone();
             let ctx = ctx.clone();
             let proceed = proceed.clone();
 
             let handle: tokio::task::JoinHandle<Result<(), CompressError>> =
-                tokio::task::spawn(async move {
-                    let cd = {
-                        let raw_data = tokio::fs::read(&absolute_path).await?;
-                        let crc32 = async_zip::base::write::crc32(&raw_data);
-                        let uncompressed_size = raw_data.len() as u64;
+                tokio::task::spawn_blocking(move || -> Result<(), CompressError> {
+                    let file = std::fs::File::open(&absolute_path)?;
+                    let uncompressed_size = file.metadata()?.len();
 
-                        let bytes = async_zip::base::write::compress(
-                            &ZipEntryBuilder::new(relative_path.clone().into(), compression)
-                                .deflate_option(deflate_option)
-                                .build(),
-                            &raw_data,
-                        )
-                        .await;
+                    let mut crc_reader = CrcReader::new(file);
 
-                        CompressedData {
-                            bytes,
-                            crc32,
-                            uncompressed_size,
-                        }
+                    let mut bytes = Vec::new();
+                    ZlibEncoder::new(&mut crc_reader, compression_level).read_to_end(&mut bytes)?;
+
+                    let crc32 = crc_reader.crc().sum();
+
+                    let cd = CompressedData {
+                        bytes,
+                        crc32,
+                        uncompressed_size,
                     };
 
                     let _ = sender.send(WriteMessage::new(idx, relative_path.clone(), Some(cd)));

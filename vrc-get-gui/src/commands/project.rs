@@ -4,7 +4,7 @@ use crate::commands::prelude::*;
 use crate::compressor::TauriCreateBackupProgress;
 use crate::compressor::parallel_compress_zip;
 use crate::utils::{collect_notable_project_files_tree, project_backup_path};
-use async_zip::{Compression, DeflateOption};
+use flate2::Compression;
 use log::{error, info, warn};
 use serde::Serialize;
 use std::ffi::OsStr;
@@ -521,8 +521,7 @@ pub fn project_is_unity_launching(project_path: String) -> bool {
 async fn create_backup_zip(
     backup_path: &Path,
     project_path: &Path,
-    compression: Compression,
-    deflate_option: DeflateOption,
+    compression_level: Compression,
     exclude_vpm: bool,
     ctx: AsyncCommandContext<TauriCreateBackupProgress>,
 ) -> Result<(), RustError> {
@@ -539,14 +538,7 @@ async fn create_backup_zip(
         start.elapsed().as_secs_f64()
     );
 
-    parallel_compress_zip(
-        file_tree,
-        backup_path.to_path_buf(),
-        compression,
-        deflate_option,
-        ctx,
-    )
-    .await?;
+    parallel_compress_zip(file_tree, backup_path.to_path_buf(), compression_level, ctx).await?;
 
     info!(
         "Creating backup archive for {} finished!",
@@ -621,8 +613,7 @@ pub async fn project_create_backup(
                     create_backup_zip(
                         &backup_path,
                         project_path.as_ref(),
-                        Compression::Stored,
-                        DeflateOption::Fast, // unused
+                        Compression::none(),
                         exclude_vpm,
                         ctx,
                     )
@@ -636,8 +627,7 @@ pub async fn project_create_backup(
                     create_backup_zip(
                         &backup_path,
                         project_path.as_ref(),
-                        Compression::Deflate,
-                        DeflateOption::Fast,
+                        Compression::fast(),
                         exclude_vpm,
                         ctx,
                     )
@@ -651,8 +641,7 @@ pub async fn project_create_backup(
                     create_backup_zip(
                         &backup_path,
                         project_path.as_ref(),
-                        Compression::Deflate,
-                        DeflateOption::Maximum,
+                        Compression::best(),
                         exclude_vpm,
                         ctx,
                     )
@@ -668,8 +657,7 @@ pub async fn project_create_backup(
                     create_backup_zip(
                         &backup_path,
                         project_path.as_ref(),
-                        Compression::Deflate,
-                        DeflateOption::Fast,
+                        Compression::fast(),
                         exclude_vpm,
                         ctx,
                     )
